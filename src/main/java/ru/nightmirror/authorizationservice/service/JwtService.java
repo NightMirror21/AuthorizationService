@@ -3,8 +3,10 @@ package ru.nightmirror.authorizationservice.service;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jws;
 import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.io.Decoders;
 import io.jsonwebtoken.security.Keys;
 import jakarta.annotation.PostConstruct;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.experimental.FieldDefaults;
 import org.springframework.beans.factory.annotation.Value;
@@ -12,9 +14,12 @@ import org.springframework.stereotype.Service;
 import ru.nightmirror.authorizationservice.model.User;
 
 import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Date;
+import java.util.UUID;
 
 import static lombok.AccessLevel.PRIVATE;
 
@@ -23,45 +28,79 @@ import static lombok.AccessLevel.PRIVATE;
 @FieldDefaults(level = PRIVATE)
 public class JwtService {
 
-    @Value("${jwt.secret}")
-    String secret;
-
+    @Getter
     @Value("${jwt.ttl-minutes}")
     long ttlMinutes;
 
-    SecretKey key;
+    @Value("${jwt.signing.secret}")
+    String signingSecretB64;
+
+    @Value("${jwt.encryption.secret}")
+    String encryptionSecretB64;
+
+    private static final String ISSUER = "auth-service";
+    private static final String AUDIENCE = "api";
+
+    SecretKey signKey;
+    SecretKey encKey;
 
     @PostConstruct
     public void initKey() {
-        key = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+        byte[] signBytes = Decoders.BASE64.decode(signingSecretB64);
+        byte[] encBytes  = Decoders.BASE64.decode(encryptionSecretB64);
+
+        signKey = Keys.hmacShaKeyFor(signBytes);
+        encKey  = new SecretKeySpec(encBytes, "AES");
     }
 
     public String generate(User user) {
-        Date now = new Date();
-        Date exp = Date.from(now.toInstant().plus(Duration.ofMinutes(ttlMinutes)));
-        return Jwts.builder()
+        Instant now = Instant.now();
+        Date iat = Date.from(now);
+        Date exp = Date.from(now.plus(Duration.ofMinutes(ttlMinutes)));
+
+        String jws = Jwts.builder()
+                .header().type("at+jwt").and()
+                .issuer(ISSUER)
+                .audience().add(AUDIENCE).and()
                 .subject(user.getUsername())
-                .claim("roles", user.getRoles())
-                .issuedAt(now)
+                .id(UUID.randomUUID().toString())
+                .issuedAt(iat)
                 .expiration(exp)
-                .signWith(key)
+                .signWith(signKey, Jwts.SIG.HS256)
+                .compact();
+
+        return Jwts.builder()
+                .content(jws, "JWT")
+                .encryptWith(encKey, Jwts.ENC.A256GCM)
                 .compact();
     }
 
-    public String extractUsername(String token) {
-        return parse(token).getPayload().getSubject();
+    public String extractUsername(String outerJwe) {
+        return parseClaims(outerJwe).getSubject();
     }
 
-    public boolean isValid(String token, User user) {
-        Claims claims = parse(token).getPayload();
-        return claims.getSubject().equals(user.getUsername()) &&
-                claims.getExpiration().after(new Date());
-    }
+    public Claims parseClaims(String outerJwe) {
+        String jws = new String(
+                Jwts.parser()
+                        .decryptWith(encKey)
+                        .build()
+                        .parseEncryptedContent(outerJwe)
+                        .getPayload(),
+                StandardCharsets.UTF_8
+        );
 
-    private Jws<Claims> parse(String token) {
         return Jwts.parser()
-                .verifyWith(key)
+                .verifyWith(signKey)
+                .requireIssuer(ISSUER)
+                .requireAudience(AUDIENCE)
                 .build()
-                .parseSignedClaims(token);
+                .parseSignedClaims(jws)
+                .getPayload();
+    }
+
+    public boolean isValid(String outerJwe, User user) {
+        Claims c = parseClaims(outerJwe);
+        return user.getUsername().equals(c.getSubject())
+                && c.getExpiration().after(new Date());
     }
 }

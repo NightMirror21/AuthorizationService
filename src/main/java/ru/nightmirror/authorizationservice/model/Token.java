@@ -20,7 +20,8 @@ public class Token {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     Long id;
 
-    String token;
+    @Column(name = "token_hash", length = 64, nullable = false)
+    String tokenHash;
 
     @Enumerated(EnumType.STRING)
     TokenType type;

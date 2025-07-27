@@ -10,11 +10,14 @@ import lombok.RequiredArgsConstructor;
 import lombok.experimental.FieldDefaults;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
+import ru.nightmirror.authorizationservice.hash.TokenHash;
+import ru.nightmirror.authorizationservice.model.Token;
 import ru.nightmirror.authorizationservice.model.User;
 import ru.nightmirror.authorizationservice.repository.TokenRepository;
 import ru.nightmirror.authorizationservice.repository.UserRepository;
@@ -22,7 +25,6 @@ import ru.nightmirror.authorizationservice.service.JwtService;
 
 import java.io.IOException;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 import static lombok.AccessLevel.PRIVATE;
@@ -42,39 +44,43 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                                     HttpServletResponse res,
                                     FilterChain chain) throws ServletException, IOException {
 
-        String header = req.getHeader(HttpHeaders.AUTHORIZATION);
-        if (header == null || !header.startsWith("Bearer ")) {
-            chain.doFilter(req, res);
-            return;
-        }
-
-        String token = header.substring(7);
-        if (token.isBlank() || !isJwt(token)) {
-            chain.doFilter(req, res);
-            return;
-        }
-
         try {
+            String header = req.getHeader(HttpHeaders.AUTHORIZATION);
+            if (header == null || !header.startsWith("Bearer ")) {
+                chain.doFilter(req, res);
+                return;
+            }
+
+            String token = header.substring(7);
+            if (token.isBlank() || !isJwtLike(token)) {
+                chain.doFilter(req, res);
+                return;
+            }
+
             String username = jwt.extractUsername(token);
             if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+                String hash = TokenHash.sha256Hex(token);
                 User user = users.findByUsername(username).orElse(null);
-                boolean validInDb = tokens.findByToken(token)
+                boolean validInDb = tokens.findByTokenHashAndType(hash, Token.TokenType.ACCESS)
                         .map(t -> !t.isExpired() && !t.isRevoked())
                         .orElse(false);
 
                 if (user != null && validInDb && jwt.isValid(token, user)) {
-                    List<SimpleGrantedAuthority> roles = user.getRoles().stream()
+                    var roles = user.getRoles().stream()
                             .map(r -> new SimpleGrantedAuthority("ROLE_" + r.name()))
                             .toList();
+
                     SecurityContextHolder.getContext()
                             .setAuthentication(new UsernamePasswordAuthenticationToken(user, null, roles));
                 }
             }
+
             chain.doFilter(req, res);
-        } catch (JwtException exception) {
+        } catch (JwtException e) {
             SecurityContextHolder.clearContext();
-            sendJsonError(res, exception);
+            sendJsonError(res, e);
         }
+
     }
 
     private void sendJsonError(HttpServletResponse res, JwtException exception) throws IOException {
@@ -87,7 +93,8 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         objectMapper.writeValue(res.getWriter(), body);
     }
 
-    private static boolean isJwt(String token) {
-        return token.chars().filter(ch -> ch == '.').count() == 2;
+    private static boolean isJwtLike(String t) {
+        return t.chars().filter(ch -> ch == '.').count() == 4;
     }
+
 }

@@ -13,6 +13,7 @@ import ru.nightmirror.authorizationservice.auth.dto.RegisterRequest;
 import ru.nightmirror.authorizationservice.error.errors.TokenAlreadyRevoked;
 import ru.nightmirror.authorizationservice.error.errors.TokenExpired;
 import ru.nightmirror.authorizationservice.error.errors.TokenNotFound;
+import ru.nightmirror.authorizationservice.hash.TokenHash;
 import ru.nightmirror.authorizationservice.model.Role;
 import ru.nightmirror.authorizationservice.model.Token;
 import ru.nightmirror.authorizationservice.model.Token.TokenType;
@@ -71,11 +72,21 @@ public class AuthenticationService {
 
     @Transactional
     public AuthResponse refresh(String refreshToken) {
-        Token stored = tokens.findByToken(refreshToken)
+        String hash = TokenHash.sha256Hex(refreshToken);
+
+        Token stored = tokens.findByTokenHash(hash)
                 .orElseThrow(TokenNotFound::new);
 
-        if (stored.isRevoked()) throw new TokenAlreadyRevoked();
-        if (stored.isExpired()) throw new TokenExpired();
+        if (stored.getExpiresAt() != null && Instant.now().isAfter(stored.getExpiresAt())) {
+            stored.setExpired(true);
+            stored.setRevoked(true);
+            tokens.save(stored);
+            throw new TokenExpired();
+        }
+
+        if (stored.isRevoked()) {
+            throw new TokenAlreadyRevoked();
+        }
 
         stored.setRevoked(true);
         tokens.save(stored);
@@ -85,33 +96,32 @@ public class AuthenticationService {
 
     @Transactional
     public void logout(String accessToken) {
-        Token token = tokens.findByToken(accessToken)
-                .orElseThrow(TokenNotFound::new);
-
-        if (token.isRevoked()) throw new TokenAlreadyRevoked();
-
+        String hash = TokenHash.sha256Hex(accessToken);
+        Token token = tokens.findByTokenHash(hash).orElseThrow(TokenNotFound::new);
+        if (token.isRevoked()) {
+            throw new TokenAlreadyRevoked();
+        }
         token.setRevoked(true);
-    }
-
-    private void verifyUniqueness(RegisterRequest request) {
-        if (users.existsByUsername(request.username()) || users.existsByEmail(request.email()))
-            throw new IllegalArgumentException("Username or e‑mail already used");
     }
 
     private AuthResponse issueTokens(User user) {
         Instant now = Instant.now();
+
         String access = jwt.generate(user);
         String refresh = UUID.randomUUID().toString();
 
+        String accessHash  = TokenHash.sha256Hex(access);
+        String refreshHash = TokenHash.sha256Hex(refresh);
+
         tokens.save(Token.builder()
-                .token(access)
+                .tokenHash(accessHash)
                 .type(TokenType.ACCESS)
-                .expiresAt(now.plus(Duration.ofMinutes(15)))
+                .expiresAt(now.plus(Duration.ofMinutes(jwt.getTtlMinutes())))
                 .user(user)
                 .build());
 
         tokens.save(Token.builder()
-                .token(refresh)
+                .tokenHash(refreshHash)
                 .type(TokenType.REFRESH)
                 .expiresAt(now.plus(Duration.ofDays(7)))
                 .user(user)
@@ -119,6 +129,7 @@ public class AuthenticationService {
 
         return new AuthResponse(access, refresh);
     }
+
 
     private void revokeActiveTokens(User user) {
         tokens.findAllByUserAndRevokedFalseAndExpiredFalse(user)
